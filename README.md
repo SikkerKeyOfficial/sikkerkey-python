@@ -1,5 +1,9 @@
 # SikkerKey Python SDK
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/sikkerkey)](https://pypi.org/project/sikkerkey/)
+[![Python](https://img.shields.io/pypi/pyversions/sikkerkey)](https://pypi.org/project/sikkerkey/)
+
 The official Python SDK for [SikkerKey](https://sikkerkey.com). Read-only access to secrets using Ed25519 machine authentication.
 
 ## Installation
@@ -201,4 +205,4 @@ All other functionality uses Python stdlib: `urllib`, `json`, `hashlib`, `os`, `
 
 ## License
 
-Proprietary. See [sikkerkey.com/terms](https://sikkerkey.com/terms) for details.
+MIT — see [LICENSE](LICENSE) for details.

@@ -7,7 +7,7 @@ name = "sikkerkey"
 version = "1.0.0"
 description = "SikkerKey Python SDK — read secrets with Ed25519 machine authentication"
 readme = "README.md"
-license = "Proprietary"
+license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
     "cryptography>=41.0",
