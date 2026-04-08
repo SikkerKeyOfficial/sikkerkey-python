@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sikkerkey"
+version = "1.0.0"
+description = "SikkerKey Python SDK — read secrets with Ed25519 machine authentication"
+readme = "README.md"
+license = "Proprietary"
+requires-python = ">=3.10"
+dependencies = [
+    "cryptography>=41.0",
+]
+
+[project.urls]
+Homepage = "https://sikkerkey.com"
+Documentation = "https://docs.sikkerkey.com/docs/sdk/python"
+Repository = "https://github.com/SikkerKeyOfficial/sikkerkey-python"
