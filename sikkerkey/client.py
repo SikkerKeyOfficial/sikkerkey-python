@@ -8,10 +8,12 @@ import json
 import os
 import re
 import secrets
+import threading
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -42,6 +44,24 @@ class SecretListItem:
     project_id: Optional[str] = None
 
 
+class WatchStatus(Enum):
+    """Status of a watched secret change."""
+    CHANGED = "changed"
+    DELETED = "deleted"
+    ACCESS_DENIED = "access_denied"
+    ERROR = "error"
+
+
+@dataclass
+class WatchEvent:
+    """Event delivered to a watch callback."""
+    secret_id: str
+    status: WatchStatus
+    value: Optional[str] = None
+    fields: Optional[dict[str, str]] = None
+    error: Optional[str] = None
+
+
 _RETRYABLE_CODES = {429, 503}
 _MAX_RETRIES = 3
 _BACKOFF_SECONDS = [1.0, 2.0, 4.0]
@@ -58,6 +78,13 @@ class SikkerKey:
     def __init__(self, vault_or_path: Optional[str] = None):
         identity_file = _resolve_identity(vault_or_path)
         self._identity, self._private_key = _load_identity(identity_file)
+
+        # Watch state
+        self._watchers: dict[str, Callable[[WatchEvent], None]] = {}
+        self._watchers_lock = threading.Lock()
+        self._poll_interval: int = 15
+        self._poll_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
 
     @property
     def machine_id(self) -> str:
@@ -140,6 +167,138 @@ class SikkerKey:
                     pass
             result[env_name] = entry["value"]
         return result
+
+    # ── Watch ──
+
+    def watch(self, secret_id: str, callback: Callable[[WatchEvent], None]) -> None:
+        """Register a callback to be invoked when a secret changes.
+
+        Starts a background daemon thread on the first call. The thread polls
+        the server at ``poll_interval`` seconds (default 15).
+
+        Args:
+            secret_id: The secret to watch.
+            callback: Called with a :class:`WatchEvent` on every detected change.
+        """
+        with self._watchers_lock:
+            self._watchers[secret_id] = callback
+            if self._poll_thread is None or not self._poll_thread.is_alive():
+                self._stop_event.clear()
+                self._poll_thread = threading.Thread(
+                    target=self._poll_loop, daemon=True
+                )
+                self._poll_thread.start()
+
+    def unwatch(self, secret_id: str) -> None:
+        """Remove a watch callback for a secret.
+
+        If no watches remain, the polling thread is stopped.
+        """
+        with self._watchers_lock:
+            self._watchers.pop(secret_id, None)
+            if not self._watchers:
+                self._stop_polling()
+
+    def set_poll_interval(self, seconds: int) -> None:
+        """Set the polling interval in seconds (minimum 10)."""
+        self._poll_interval = max(seconds, 10)
+
+    def close(self) -> None:
+        """Stop polling and clear all watches."""
+        with self._watchers_lock:
+            self._watchers.clear()
+            self._stop_polling()
+
+    def _stop_polling(self) -> None:
+        """Signal the poll thread to exit and wait for it."""
+        self._stop_event.set()
+        thread = self._poll_thread
+        self._poll_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5)
+
+    def _poll_loop(self) -> None:
+        """Background loop that polls the server for secret changes."""
+        while not self._stop_event.is_set():
+            with self._watchers_lock:
+                if not self._watchers:
+                    return
+                watched_ids = list(self._watchers.keys())
+
+            try:
+                payload = json.dumps({"watch": watched_ids})
+                body = self._request("POST", "/v1/secrets/poll", payload)
+                changes = json.loads(body).get("changes", {})
+            except Exception:
+                # Network/auth errors during poll are non-fatal; retry next cycle
+                self._stop_event.wait(self._poll_interval)
+                continue
+
+            for secret_id, info in changes.items():
+                status_str = info.get("status", "")
+
+                with self._watchers_lock:
+                    callback = self._watchers.get(secret_id)
+                if callback is None:
+                    continue
+
+                if status_str == "changed":
+                    self._handle_changed(secret_id, callback)
+                elif status_str in ("deleted", "access_denied"):
+                    status = (
+                        WatchStatus.DELETED
+                        if status_str == "deleted"
+                        else WatchStatus.ACCESS_DENIED
+                    )
+                    event = WatchEvent(secret_id=secret_id, status=status)
+                    self._fire_callback(callback, event)
+                    with self._watchers_lock:
+                        self._watchers.pop(secret_id, None)
+
+            self._stop_event.wait(self._poll_interval)
+
+    def _handle_changed(
+        self,
+        secret_id: str,
+        callback: Callable[[WatchEvent], None],
+    ) -> None:
+        """Fetch the new value of a changed secret and fire the callback."""
+        try:
+            value = self.get_secret(secret_id)
+        except Exception as exc:
+            event = WatchEvent(
+                secret_id=secret_id,
+                status=WatchStatus.ERROR,
+                error=str(exc),
+            )
+            self._fire_callback(callback, event)
+            return
+
+        fields: Optional[dict[str, str]] = None
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                fields = {k: str(v) for k, v in parsed.items()}
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        event = WatchEvent(
+            secret_id=secret_id,
+            status=WatchStatus.CHANGED,
+            value=value,
+            fields=fields,
+        )
+        self._fire_callback(callback, event)
+
+    @staticmethod
+    def _fire_callback(
+        callback: Callable[[WatchEvent], None], event: WatchEvent
+    ) -> None:
+        """Invoke a user callback, suppressing exceptions."""
+        try:
+            callback(event)
+        except Exception:
+            pass
 
     # ── List Vaults ──
 

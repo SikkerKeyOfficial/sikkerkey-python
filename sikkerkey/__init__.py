@@ -15,7 +15,7 @@ Structured secrets::
     password = fields["password"]
 """
 
-from sikkerkey.client import SikkerKey, SecretListItem
+from sikkerkey.client import SikkerKey, SecretListItem, WatchStatus, WatchEvent
 from sikkerkey.exceptions import (
     SikkerKeyError,
     ConfigurationError,
@@ -33,6 +33,8 @@ from sikkerkey.exceptions import (
 __all__ = [
     "SikkerKey",
     "SecretListItem",
+    "WatchStatus",
+    "WatchEvent",
     "SikkerKeyError",
     "ConfigurationError",
     "ApiError",

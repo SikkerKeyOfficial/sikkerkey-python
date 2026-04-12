@@ -97,6 +97,69 @@ os.environ.update(sk.export())
 
 Structured secrets are flattened: `SECRET_NAME_FIELD_NAME`.
 
+## Watching for Changes
+
+Watch secrets for real-time updates. When a secret is rotated, updated, or deleted, the callback fires with the new value. Polling happens on a background daemon thread - your application is never blocked.
+
+```python
+from sikkerkey import WatchStatus
+
+def on_change(event):
+    if event.status == WatchStatus.CHANGED:
+        print(f"New value: {event.value}")
+        # Structured secrets include parsed fields
+        print(f"Fields: {event.fields}")
+    elif event.status == WatchStatus.DELETED:
+        print("Secret was deleted")
+    elif event.status == WatchStatus.ACCESS_DENIED:
+        print("Access revoked")
+    elif event.status == WatchStatus.ERROR:
+        print(f"Error: {event.error}")
+
+sk.watch("sk_db_password", on_change)
+```
+
+### Practical Example
+
+```python
+# Auto-rotate database credentials
+def rotate_db(event):
+    if event.status == WatchStatus.CHANGED:
+        db.configure_credentials(
+            username=event.fields["username"],
+            password=event.fields["password"],
+        )
+
+sk.watch("sk_db_credentials", rotate_db)
+```
+
+### Poll Interval
+
+The default poll interval is 15 seconds. The server enforces a minimum of 10 seconds.
+
+```python
+sk.set_poll_interval(30)  # seconds
+```
+
+### Stop Watching
+
+```python
+# Stop watching a specific secret
+sk.unwatch("sk_db_password")
+
+# Stop all watches and shut down polling
+sk.close()
+```
+
+`SikkerKey` can be used as a context manager:
+
+```python
+with SikkerKey("vault_abc123") as sk:
+    sk.watch("sk_api_key", on_change)
+    # ... application logic ...
+# Automatically closed on exit
+```
+
 ## Multi-Vault
 
 ```python
@@ -190,6 +253,10 @@ Every request includes Ed25519-signed headers: `X-Machine-Id`, `X-Timestamp`, `X
 | `list_secrets()` | `list[SecretListItem]` | List all accessible secrets |
 | `list_secrets_by_project(project_id)` | `list[SecretListItem]` | List secrets in a project |
 | `export(project_id?)` | `dict[str, str]` | Export as env map |
+| `watch(secret_id, callback)` | `None` | Watch a secret for changes |
+| `unwatch(secret_id)` | `None` | Stop watching a secret |
+| `set_poll_interval(seconds)` | `None` | Set poll interval (min 10s) |
+| `close()` | `None` | Stop all watches, shut down polling |
 
 ## Dependencies
 
