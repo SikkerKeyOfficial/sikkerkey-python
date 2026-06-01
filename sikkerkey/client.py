@@ -18,7 +18,11 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import load_pem_private_key
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    PublicFormat,
+    load_pem_private_key,
+)
 
 from sikkerkey.exceptions import (
     AccessDeniedError,
@@ -78,13 +82,50 @@ class SikkerKey:
     def __init__(self, vault_or_path: Optional[str] = None):
         identity_file = _resolve_identity(vault_or_path)
         self._identity, self._private_key = _load_identity(identity_file)
+        self._init_watch_state()
 
-        # Watch state
+    def _init_watch_state(self) -> None:
         self._watchers: dict[str, Callable[[WatchEvent], None]] = {}
         self._watchers_lock = threading.Lock()
         self._poll_interval: int = 15
         self._poll_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+
+    @classmethod
+    def bootstrap_in_memory(
+        cls,
+        vault_id: str,
+        token: str,
+        *,
+        hostname: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> "SikkerKey":
+        """Enroll an ephemeral machine in memory and return a ready client.
+
+        For serverless and other ephemeral or read-only-filesystem environments
+        that have no identity on disk. Generates an Ed25519 keypair in memory,
+        registers an ephemeral machine with the enrollment token, and returns a
+        client whose identity lives only in process memory; nothing is written
+        to disk.
+
+        Enrollment happens once, here. The returned client then behaves exactly
+        like one loaded from disk: it signs each read with the in-memory key.
+        The ephemeral machine lives for the lifetime set on the enrollment
+        token; reading after it expires raises :class:`AuthenticationError`, so
+        size the token's machine lifetime to the workload. The common path is to
+        read secrets at startup and hold the values.
+
+        Args:
+            vault_id: The vault ID (``vault_...``).
+            token: The plaintext of an enrollment token.
+            hostname: Hostname recorded on the machine. Defaults to ``$HOSTNAME``
+                then ``"serverless"``. Must match the token's hostname pattern if set.
+            name: Optional machine name. Overridden when the token defines a name pattern.
+        """
+        obj = cls.__new__(cls)
+        obj._identity, obj._private_key = _bootstrap_enroll(vault_id, token, hostname, name)
+        obj._init_watch_state()
+        return obj
 
     @property
     def machine_id(self) -> str:
@@ -466,6 +507,81 @@ def _load_identity(path: str) -> tuple[dict, Ed25519PrivateKey]:
         raise ConfigurationError(f"Failed to load private key: {e}")
 
     return identity, private_key
+
+
+# ── Bootstrap (in-memory enrollment) ──
+
+_DEFAULT_API_URL = "https://api.sikkerkey.com"
+
+
+def _bootstrap_enroll(
+    vault_id: str,
+    token: str,
+    hostname: Optional[str],
+    name: Optional[str],
+) -> tuple[dict, Ed25519PrivateKey]:
+    if not vault_id:
+        raise ConfigurationError("bootstrap_in_memory requires a vault ID")
+    if not token:
+        raise ConfigurationError("bootstrap_in_memory requires an enrollment token")
+
+    # SikkerKey is a managed service; the API URL is fixed. The env override is for local dev only.
+    api_url = os.environ.get("SIKKERKEY_API_URL", _DEFAULT_API_URL)
+    if not api_url.startswith("https://") and not api_url.startswith("http://localhost"):
+        raise ConfigurationError(
+            f"API URL must use HTTPS: {api_url}. Use http://localhost only for local development."
+        )
+    api_url = api_url.rstrip("/")
+
+    # Generate the keypair in memory. The private key never leaves this process.
+    private_key = Ed25519PrivateKey.generate()
+    raw_pub = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    # Server expects the raw 32-byte public key as standard base64 (44 chars).
+    public_key_b64 = base64.b64encode(raw_pub).decode()
+
+    host = hostname or os.environ.get("HOSTNAME") or "serverless"
+    body: dict[str, str] = {"token": token, "publicKey": public_key_b64, "hostname": host}
+    if name:
+        body["name"] = name
+
+    resp = _enroll_register(api_url, vault_id, json.dumps(body))
+    identity = {
+        "machineId": resp["machineId"],
+        "machineName": resp.get("machineName", ""),
+        "vaultId": resp["vaultId"],
+        "apiUrl": api_url,
+        "privateKeyPath": "",
+    }
+    return identity, private_key
+
+
+def _enroll_register(api_url: str, vault_id: str, body: str) -> dict:
+    url = f"{api_url}/v1/{vault_id}/enroll/register"
+    req = Request(url, data=body.encode(), method="POST")
+    req.add_header("Content-Type", "application/json")
+
+    try:
+        with urlopen(req, timeout=15) as resp:
+            response_body = resp.read().decode()
+            code = resp.status
+    except URLError as e:
+        if hasattr(e, "code"):
+            code = e.code  # type: ignore[union-attr]
+            response_body = e.read().decode() if hasattr(e, "read") else ""  # type: ignore[union-attr]
+        else:
+            raise ApiError(f"Enrollment network error: {e.reason}", 0)
+
+    if 200 <= code < 300:
+        data = json.loads(response_body)
+        if not data.get("machineId") or not data.get("vaultId"):
+            raise ApiError("Malformed enrollment response", code)
+        return data
+
+    try:
+        error_msg = json.loads(response_body).get("error", response_body)
+    except (json.JSONDecodeError, AttributeError):
+        error_msg = response_body or f"HTTP {code}"
+    raise _make_exception(code, error_msg)
 
 
 # ── Helpers ──
