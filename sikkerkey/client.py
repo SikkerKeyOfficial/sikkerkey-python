@@ -69,6 +69,7 @@ class WatchEvent:
 _RETRYABLE_CODES = {429, 503}
 _MAX_RETRIES = 3
 _BACKOFF_SECONDS = [1.0, 2.0, 4.0]
+_USER_AGENT = "sikkerkey-python/1.2.1"
 
 
 class SikkerKey:
@@ -383,6 +384,7 @@ class SikkerKey:
             url = self._identity["apiUrl"] + path
             data = body.encode() if body else None
             req = Request(url, data=data, method=method)
+            req.add_header("User-Agent", _USER_AGENT)
             req.add_header("X-Machine-Id", self._identity["machineId"])
             req.add_header("X-Timestamp", timestamp)
             req.add_header("X-Nonce", nonce)
@@ -559,6 +561,7 @@ def _enroll_register(api_url: str, vault_id: str, body: str) -> dict:
     url = f"{api_url}/v1/{vault_id}/enroll/register"
     req = Request(url, data=body.encode(), method="POST")
     req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", _USER_AGENT)
 
     try:
         with urlopen(req, timeout=15) as resp:
