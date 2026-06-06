@@ -551,7 +551,10 @@ def _bootstrap_enroll(
         "machineId": resp["machineId"],
         "machineName": resp.get("machineName", ""),
         "vaultId": resp["vaultId"],
-        "apiUrl": api_url,
+        # Enrollment ran against the backend (api_url); runtime reads go to the
+        # retrieval plane the backend hands back. Fall back to the enroll URL
+        # only if an older endpoint omits it.
+        "apiUrl": resp.get("apiUrl") or api_url,
         "privateKeyPath": "",
     }
     return identity, private_key
