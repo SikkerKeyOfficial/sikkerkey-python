@@ -24,6 +24,7 @@ from cryptography.hazmat.primitives.serialization import (
     load_pem_private_key,
 )
 
+from sikkerkey.cache import CacheResult, SecretCache, derive_key
 from sikkerkey.exceptions import (
     AccessDeniedError,
     ApiError,
@@ -37,6 +38,16 @@ from sikkerkey.exceptions import (
     ServerSealedError,
     SikkerKeyError,
 )
+
+# Statuses that mean no authoritative answer reached us from the origin, so the
+# fallback cache may serve: 502/504 (gateway), 503 (temporarily unavailable),
+# 520-527 (the Cloudflare origin-error family), 530 (edge can't reach origin).
+# 401/403/404/429 (authoritative) and 500/501 (origin ran and errored) are excluded.
+_UNAVAILABLE_STATUSES = {502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527, 530}
+
+
+def _is_unavailable(e: BaseException) -> bool:
+    return isinstance(e, ApiError) and (e.http_status == 0 or e.http_status in _UNAVAILABLE_STATUSES)
 
 
 @dataclass
@@ -91,6 +102,12 @@ class SikkerKey:
         self._poll_interval: int = 15
         self._poll_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        # Fallback cache — off until enable_cache() is called. When off, a read
+        # touches no cache code and the key below is never derived.
+        self._cache_enabled: bool = False
+        self._cache_max_age: Optional[float] = None
+        self._cache_on_fallback: Optional[Callable[[str, int], None]] = None
+        self._cache_instance: Optional[SecretCache] = None
 
     @classmethod
     def bootstrap_in_memory(
@@ -144,12 +161,81 @@ class SikkerKey:
     def api_url(self) -> str:
         return self._identity["apiUrl"]
 
+    def enable_cache(
+        self,
+        *,
+        max_age: Optional[float] = None,
+        on_fallback: Optional[Callable[[str, int], None]] = None,
+    ) -> "SikkerKey":
+        """Enable the on-disk fallback cache and return self (chainable)::
+
+            sk = SikkerKey().enable_cache()
+
+        While enabled, every secret read is written to an encrypted, identity-bound
+        file under ``~/.sikkerkey/vaults/<vault>/cache/``, and served from there when
+        the retrieval plane is unreachable (a network failure, or a gateway/origin
+        error like 502/504 or a Cloudflare 52x) — never when the server returns an
+        authoritative answer (access denied, deleted, bad auth). Off by default:
+        until this is called, a read never touches the cache.
+
+        Args:
+            max_age: If set, the oldest (in seconds) a cached value may be to still
+                be served during an outage. Omit for no expiry.
+            on_fallback: Called as ``on_fallback(secret_id, cached_at)`` when a value
+                is served from the cache — for your own logging or metrics. The SDK
+                itself emits nothing; a fallback is otherwise transparent.
+        """
+        self._cache_enabled = True
+        self._cache_max_age = max_age
+        self._cache_on_fallback = on_fallback
+        return self
+
     # ── Read ──
 
     def get_secret(self, secret_id: str) -> str:
         """Fetch a secret value by ID."""
-        body = self._request("GET", f"/v1/secret/{secret_id}")
-        return json.loads(body)["value"]
+        # Fast path: caching off → behave exactly as before, touching no cache code.
+        if not self._cache_enabled:
+            body = self._request("GET", f"/v1/secret/{secret_id}")
+            return json.loads(body)["value"]
+        try:
+            body = self._request("GET", f"/v1/secret/{secret_id}")
+            value = json.loads(body)["value"]
+            try:
+                self._get_cache().store(secret_id, "", value, None)
+            except Exception:
+                pass  # caching is best-effort
+            return value
+        except Exception as e:
+            if _is_unavailable(e):
+                hit = self._load_from_cache(secret_id)
+                if hit is not None:
+                    # Transparent by default; the app observes fallback only via on_fallback.
+                    if self._cache_on_fallback is not None:
+                        self._cache_on_fallback(secret_id, hit.cached_at)
+                    return hit.value
+            raise
+
+    def _get_cache(self) -> SecretCache:
+        """Lazily build the cache, deriving its key from the Ed25519 seed on first use."""
+        if self._cache_instance is None:
+            seed = self._private_key.private_bytes_raw()
+            self._cache_instance = SecretCache(
+                self.vault_id, self.machine_id, derive_key(seed, self.vault_id)
+            )
+        return self._cache_instance
+
+    def _load_from_cache(self, secret_id: str) -> Optional[CacheResult]:
+        """Load a cached entry honoring max_age. Returns None on miss/expiry/error."""
+        try:
+            hit = self._get_cache().load(secret_id)
+        except Exception:
+            return None
+        if hit is None:
+            return None
+        if self._cache_max_age is not None and (time.time() - hit.cached_at) > self._cache_max_age:
+            return None
+        return hit
 
     def get_fields(self, secret_id: str) -> dict[str, str]:
         """Fetch a structured secret as a dict of field names to values."""

@@ -55,7 +55,7 @@ class RateLimitedError(ApiError):
 
 
 class ServerSealedError(ApiError):
-    """503 — server is sealed, awaiting unseal."""
+    """503 — the service is temporarily unavailable."""
 
     def __init__(self, message: str):
         super().__init__(message, 503)
