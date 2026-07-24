@@ -26,7 +26,7 @@ pip install sikkerkey
 To install the version represented by this source:
 
 ```bash
-pip install sikkerkey==1.2.2
+pip install sikkerkey==1.3.0
 ```
 
 ## Read your first secret
